@@ -1,3 +1,6 @@
+[] TBD: pick a better default font
+[] allow bolding
+
 ====
 nvPY
 ====
