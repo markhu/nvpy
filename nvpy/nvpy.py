@@ -35,6 +35,7 @@ import ConfigParser
 import logging
 from logging.handlers import RotatingFileHandler
 from notes_db import NotesDB, SyncError, ReadError, WriteError
+import argparse
 import os
 import sys
 import time
@@ -58,7 +59,7 @@ except ImportError:
 else:
     HAVE_DOCUTILS = True
 
-VERSION = "0.9.4"
+VERSION = "1.0.0 BETA2"
 
 
 class Config:
@@ -87,6 +88,7 @@ class Config:
                     'pinned_ontop': '1',
                     'db_path': os.path.join(home, '.nvpy'),
                     'txt_path': os.path.join(home, '.nvpy/notes'),
+                    'theme': 'default',
                     'font_family': 'Courier',  # monospaced on all platforms
                     'font_size': '10',
                     'list_font_family': 'Helvetica',  # sans on all platforms
@@ -98,20 +100,30 @@ class Config:
                     'sn_username': '',
                     'sn_password': '',
                     'simplenote_sync': '1',
-                    'debug' : '1',
+                    'debug': '1',
                     # Filename or filepath to a css file used style the rendered
                     # output; e.g. nvpy.css or /path/to/my.css
                     'rest_css_path': None,
                    }
 
-        cp = ConfigParser.SafeConfigParser(defaults)
+        # parse command-line arguments
+        args = self.parse_cmd_line_opts()
+
         # later config files overwrite earlier files
         # try a number of alternatives
-        self.files_read = cp.read([os.path.join(app_dir, 'nvpy.cfg'),
-                                   os.path.join(home, 'nvpy.cfg'),
-                                   os.path.join(home, '.nvpy.cfg'),
-                                   os.path.join(home, '.nvpy'),
-                                   os.path.join(home, '.nvpyrc')])
+        cfg_files = [os.path.join(app_dir, 'nvpy.cfg'),
+                     os.path.join(home, 'nvpy.cfg'),
+                     os.path.join(home, '.nvpy.cfg'),
+                     os.path.join(home, '.nvpy'),
+                     os.path.join(home, '.nvpyrc')]
+
+        # user has specified either a specific path to a CFG file, or a
+        # path relative to the nvpy.py location. specific takes precedence.
+        if args is not None and args.cfg is not None:
+            cfg_files.extend([os.path.join(app_dir, args.cfg), args.cfg])
+
+        cp = ConfigParser.SafeConfigParser(defaults)
+        self.files_read = cp.read(cfg_files)
 
         cfg_sec = 'nvpy'
 
@@ -141,6 +153,7 @@ class Config:
         self.housekeeping_interval = cp.getint(cfg_sec, 'housekeeping_interval')
         self.housekeeping_interval_ms = self.housekeeping_interval * 1000
 
+        self.theme = cp.get(cfg_sec, 'theme')
         self.font_family = cp.get(cfg_sec, 'font_family')
         self.font_size = cp.getint(cfg_sec, 'font_size')
 
@@ -154,7 +167,17 @@ class Config:
         self.background_color = cp.get(cfg_sec, 'background_color')
 
         self.rest_css_path = cp.get(cfg_sec, 'rest_css_path')
-        self.debug = cp.get(cfg_sec, 'debug')
+        self.debug = cp.getint(cfg_sec, 'debug')
+
+    def parse_cmd_line_opts(self):
+        if __name__ != '__main__':
+            return None
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--cfg', '-c', default='', dest='cfg',
+                            metavar='nvpy.cfg', help='path to config file')
+        args = parser.parse_args()
+        return args
 
 
 class NotesListModel(SubjectMixin):
@@ -187,22 +210,9 @@ class Controller:
     """Main application class.
     """
 
-    def __init__(self):
-        # setup appdir
-        if hasattr(sys, 'frozen') and sys.frozen:
-            self.appdir, _ = os.path.split(sys.executable)
-        else:
-            dirname, _ = os.path.split(os.path.realpath(__file__))
-            if dirname and dirname != os.curdir:
-                self.appdir = dirname
-            else:
-                self.appdir = os.getcwd()
-
-        # make sure it's the full path
-        self.appdir = os.path.abspath(self.appdir)
-
+    def __init__(self, config):
         # should probably also look in $HOME
-        self.config = Config(self.appdir)
+        self.config = config
         self.config.app_version = VERSION
 
         # configure logging module
@@ -269,14 +279,13 @@ class Controller:
         self.view.add_observer('select:note', self.observer_view_select_note)
         self.view.add_observer('change:entry', self.observer_view_change_entry)
         self.view.add_observer('change:text', self.observer_view_change_text)
-        self.view.add_observer('change:tags', self.observer_view_change_tags)
         self.view.add_observer('change:pinned', self.observer_view_change_pinned)
         self.view.add_observer('create:note', self.observer_view_create_note)
         self.view.add_observer('keep:house', self.observer_view_keep_house)
-        self.view.add_observer('command:markdown',
-                self.observer_view_markdown)
-        self.view.add_observer('command:rest',
-                self.observer_view_rest)
+        self.view.add_observer('command:markdown', self.observer_view_markdown)
+        self.view.add_observer('command:rest', self.observer_view_rest)
+        self.view.add_observer('delete:tag', self.observer_view_delete_tag)
+        self.view.add_observer('add:tag', self.observer_view_add_tag)
 
         if self.config.simplenote_sync:
             self.view.add_observer('command:sync_full', lambda v, et, e: self.sync_full())
@@ -406,13 +415,13 @@ class Controller:
 <html>
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
-<meta http-equiv="refresh" content="5">
+%s
 </head>
 <body>
 %s
 </body>
 </html>
-            """ % (html,)
+            """ % ('<meta http-equiv="refresh" content="5">' if self.view.get_continuous_rendering() else "",html,)
             f.write(s)
             f.close()
             return fn
@@ -593,6 +602,18 @@ class Controller:
         if self.selected_note_idx >= 0:
             key = self.notes_list_model.list[self.selected_note_idx].key
             self.notes_db.set_note_tags(key, evt.value)
+            self.view.cmd_notes_list_select()
+
+    def observer_view_delete_tag(self, view, evt_type, evt):
+        key = self.notes_list_model.list[self.selected_note_idx].key
+        self.notes_db.delete_note_tag(key, evt.tag)
+        self.view.cmd_notes_list_select()
+    
+    def observer_view_add_tag(self, view, evt_type, evt):
+        key = self.notes_list_model.list[self.selected_note_idx].key
+        self.notes_db.add_note_tags(key, evt.tags)
+        self.view.cmd_notes_list_select()
+        self.view.tags_entry_var.set('')
 
     def observer_view_change_pinned(self, view, evt_type, evt):
         # get new text and update our database
@@ -645,7 +666,6 @@ class Controller:
         @param idx:
         @return:
         """
-
         if idx >= 0:
             key = self.notes_list_model.list[idx].key
             note = self.notes_db.get_note(key)
@@ -695,7 +715,23 @@ class Controller:
 
 
 def main():
-    controller = Controller()
+    # setup appdir
+    if hasattr(sys, 'frozen') and sys.frozen:
+        appdir, _ = os.path.split(sys.executable)
+
+    else:
+        dirname, _ = os.path.split(os.path.realpath(__file__))
+        if dirname and dirname != os.curdir:
+            appdir = dirname
+        else:
+            appdir = os.getcwd()
+
+    # make sure it's the full path
+    appdir_full_path = os.path.abspath(appdir)
+
+    config = Config(appdir_full_path)
+
+    controller = Controller(config)
     controller.main_loop()
 
 
